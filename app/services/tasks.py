@@ -287,7 +287,7 @@ def task_critique_anchor(image_path: str, prompt: str, style: str) -> Dict:
 @retry_backoff()
 def task_gen_anchor(pid: str, seg_id: str, seg: Dict, assets: Dict[str, Dict], style: str, neg_prompt: str, is_end=False, start_anchor_path=None):
     suffix = "end" if is_end else "start"
-    gcs_final_path = get_gcs_path(pid, "anchors", f"{seg_id}_{suffix}.png")
+    gcs_final_path = get_gcs_path(pid, "anchors", f"{seg_id}_{suffix}_{uuid.uuid4().hex[:6]}.png")
     
     log_project(pid, f"[ANCHOR {seg_id}] Generating {suffix.upper()}...")
     
@@ -375,7 +375,7 @@ def task_optimize_veo_prompt(seg: Dict, style: str) -> str:
 
 @retry_backoff()
 def task_run_veo(pid: str, seg_id: str, seg: Dict, anchor_path: str, style: str, end_anchor_path: str = None):
-    gcs_out_path = get_gcs_path(pid, "output", f"{seg_id}_raw.mp4")
+    gcs_out_path = get_gcs_path(pid, "output", f"{seg_id}_raw_{uuid.uuid4().hex[:6]}.mp4")
     optimized_prompt = task_optimize_veo_prompt(seg, style)
     mode = seg.get("mode", "i2v")
     duration = int(seg.get("duration", 4))
@@ -417,7 +417,7 @@ def task_render_audio(pid: str, seg_id: str, seg: Dict, narrator_style: str, lan
     if lang.lower() in ["english", "en"]: lang = "en-US"
     narration = seg.get("narration")
     if not narration: return None
-    gcs_path = get_gcs_path(pid, "audio", f"tts_{seg_id}.mp3")
+    gcs_path = get_gcs_path(pid, "audio", f"tts_{seg_id}_{uuid.uuid4().hex[:6]}.mp3")
     res = tts_client.synthesize_speech(input=texttospeech.SynthesisInput(text=narration, prompt=narrator_style), voice=texttospeech.VoiceSelectionParams(language_code=lang, name=VOICE_NAME, model_name=MODEL_TTS), audio_config=texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3))
     upload_bytes_to_gcs(res.audio_content, gcs_path, content_type="audio/mpeg")
     return gcs_path
