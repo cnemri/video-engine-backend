@@ -1,6 +1,6 @@
 from typing import Dict, Any, Literal
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Body, Depends
-from ..models import VeoI2VSegment, VeoInterpSegment, VeoMode, DetectiveReport, AssetDef, ArchitectManifest
+from ..models import VeoMode 
 from ..services.projects import get_project, update_project, log_project
 from ..services.tasks import task_gen_anchor, task_run_veo, task_render_audio
 from ..dependencies import get_current_user
@@ -37,15 +37,13 @@ async def regenerate_anchor_endpoint(pid: str, sid: str, type: Literal["start", 
     
     def _regen_task(pid, sid, seg_data, type):
         try:
-            seg = VeoI2VSegment(**seg_data) if seg_data['mode'] == VeoMode.I2V else VeoInterpSegment(**seg_data)
             curr_proj = get_project(pid)
-            report = DetectiveReport(**curr_proj["report"])
-            asset_map = {k: AssetDef(**v) for k,v in curr_proj["asset_map"].items()}
-            start_anchor = curr_proj["anchor_map"].get(f"{sid}_start") if type == 'end' else None
+            report = curr_proj["report"]
+            asset_map = curr_proj.get("asset_map", {})
+            start_anchor = curr_proj.get("anchor_map", {}).get(f"{sid}_start") if type == 'end' else None
             
-            new_path = task_gen_anchor(pid, sid, seg, asset_map, report.visual_style, report.negative_prompt, is_end=(type=='end'), start_anchor_path=start_anchor)
+            new_path = task_gen_anchor(pid, sid, seg_data, asset_map, report.get("visual_style"), report.get("negative_prompt"), is_end=(type=='end'), start_anchor_path=start_anchor)
             
-            # Read-modify-write anchor_map
             curr_proj = get_project(pid)
             anchor_map = curr_proj.get("anchor_map", {})
             anchor_map[f"{sid}_{type}"] = new_path
@@ -67,14 +65,13 @@ async def regenerate_video_endpoint(pid: str, sid: str, background_tasks: Backgr
     
     def _regen_task(pid, sid, seg_data):
         try:
-            seg = VeoI2VSegment(**seg_data) if seg_data['mode'] == VeoMode.I2V else VeoInterpSegment(**seg_data)
             curr_proj = get_project(pid)
-            report = DetectiveReport(**curr_proj["report"])
-            anchor_start = curr_proj["anchor_map"].get(f"{sid}_start")
-            anchor_end = curr_proj["anchor_map"].get(f"{sid}_end")
+            report = curr_proj["report"]
+            anchor_start = curr_proj.get("anchor_map", {}).get(f"{sid}_start")
+            anchor_end = curr_proj.get("anchor_map", {}).get(f"{sid}_end")
             if not anchor_start: raise Exception("Start anchor missing")
             
-            new_path = task_run_veo(pid, sid, seg, anchor_start, report.visual_style, anchor_end)
+            new_path = task_run_veo(pid, sid, seg_data, anchor_start, report.get("visual_style"), anchor_end)
             
             curr_proj = get_project(pid)
             video_map = curr_proj.get("video_map", {})
@@ -97,10 +94,9 @@ async def regenerate_tts_endpoint(pid: str, sid: str, background_tasks: Backgrou
     
     def _regen_task(pid, sid, seg_data):
         try:
-            seg = VeoI2VSegment(**seg_data) if seg_data['mode'] == VeoMode.I2V else VeoInterpSegment(**seg_data)
             curr_proj = get_project(pid)
-            manifest = ArchitectManifest(**curr_proj["manifest"])
-            new_path = task_render_audio(sid, seg, manifest.narrator_voice_style, manifest.language)
+            manifest = curr_proj["manifest"]
+            new_path = task_render_audio(pid, sid, seg_data, manifest.get("narrator_voice_style"), manifest.get("language"))
             if new_path:
                 curr_proj = get_project(pid)
                 audio_map = curr_proj.get("audio_map", {})
