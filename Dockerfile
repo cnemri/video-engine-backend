@@ -12,9 +12,8 @@ COPY pyproject.toml uv.lock ./
 RUN pip install uv
 RUN uv pip install --system -r pyproject.toml
 
-# Copy service account key (must be present in backend/ folder before building)
-COPY service-account.json /app/service-account.json
-ENV GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
+# Note: For Cloud Run, we use Application Default Credentials (ADC).
+# No need to copy service-account.json or set GOOGLE_APPLICATION_CREDENTIALS.
 
 # Copy the rest of the application code
 COPY . .

@@ -64,17 +64,14 @@ This is the easiest and most secure way for local development.
 
 The application will automatically pick up these credentials.
 
-### Option B: Service Account (Server/Docker)
+### Option B: Cloud Run (Production)
 
-If running on a server or if Option A is not possible:
+When deployed to Google Cloud Run, the application automatically uses the **Application Default Credentials (ADC)** of the service account attached to the Cloud Run service.
 
-1.  Create a Service Account in your Google Cloud Project.
-2.  Grant it the following roles:
-    *   **Vertex AI User** (`roles/aiplatform.user`)
-    *   **Service Usage Consumer** (`roles/serviceusage.serviceUsageConsumer`)
-3.  Download the JSON key file.
-4.  Save it as `service-account.json` in the `backend/` directory.
-5.  **IMPORTANT:** Ensure `service-account.json` is in your `.gitignore` file to prevent leaking secrets.
+**Requirements:**
+Ensure the Cloud Run service account (usually the default Compute Engine service account) has the following IAM roles:
+*   **Vertex AI User** (`roles/aiplatform.user`)
+*   **Service Usage Consumer** (`roles/serviceusage.serviceUsageConsumer`)
 
 ## Running the Server
 
@@ -90,16 +87,29 @@ The API will be available at `http://localhost:8000`.
 
 ## Deployment (Google Cloud Run)
 
-To deploy the backend to Google Cloud Run, you can use the provided `x.sh` script or run the following commands manually.
+To deploy the backend to Google Cloud Run, you can use the provided `deploy.sh` script. This script automatically grants the necessary IAM permissions and deploys the container.
 
-1.  **Build the Container:**
+1.  **Run the deployment script:**
+    ```bash
+    ./deploy.sh
+    ```
+
+    ```bash
+    export FIREBASE_STORAGE_BUCKET=your-bucket-name.firebasestorage.app
+    ./deploy.sh
+    ```
+
+Alternatively, you can run the commands manually:
+
+1.  **Grant Permissions:**
+    (See `deploy.sh` for the exact `gcloud projects add-iam-policy-binding` commands)
+
+2.  **Build the Container:**
     ```bash
     gcloud builds submit --tag gcr.io/$(gcloud config get-value project)/video-engine-backend
     ```
 
-2.  **Deploy to Cloud Run:**
-    Replace `YOUR_FIREBASE_BUCKET` with your actual Firebase Storage bucket name (e.g., `your-project-id.firebasestorage.app`).
-
+3.  **Deploy to Cloud Run:**
     ```bash
     gcloud run deploy video-engine-backend \
        --image gcr.io/$(gcloud config get-value project)/video-engine-backend \

@@ -16,7 +16,7 @@ try:
             cred = credentials.ApplicationDefault()
 
         firebase_admin.initialize_app(cred, {
-            'storageBucket': os.getenv('FIREBASE_STORAGE_BUCKET', "ai-video-engine-ade38.firebasestorage.app")
+            'storageBucket': os.getenv('FIREBASE_STORAGE_BUCKET')
         })
         
     db = firestore.client()

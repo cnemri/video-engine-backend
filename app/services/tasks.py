@@ -49,6 +49,13 @@ def get_media_duration(fpath):
     try: return float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", fpath]).decode().strip())
     except: return 0.0
 
+def has_audio_stream(fpath):
+    try:
+        out = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", fpath])
+        return len(out.strip()) > 0
+    except:
+        return False
+
 def parse_json_response(res, model_cls):
     try:
         return json.loads(res.text)
@@ -439,12 +446,14 @@ def task_assemble(pid: str, manifest: Dict, v_map: Dict[str, str], a_map: Dict[s
              dur_v, dur_a = get_media_duration(vid_local), get_media_duration(aud_local)
              tempo = min(2.0, max(1.0, dur_a / dur_v)) if dur_v > 0 else 1.0
              cmd.extend(["-i", aud_local])
-             # Use narration audio only (ignore video audio as Veo is silent)
-             filter_chain.append(f"[1:a]atempo={tempo},apad,volume=1.5,aformat=channel_layouts=stereo[a]")
+             
+             # Mix video audio (30%) and narration (150%)
+             filter_chain.append("[0:a]volume=0.3[bg]")
+             filter_chain.append(f"[1:a]atempo={tempo},apad,volume=1.5[fg]")
+             filter_chain.append("[bg][fg]amix=inputs=2:duration=first[a]")
         else:
-             # Generate silent audio track
-             cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
-             filter_chain.append("[1:a]aformat=channel_layouts=stereo[a]")
+             # Use video audio at 100%
+             filter_chain.append("[0:a]aformat=channel_layouts=stereo[a]")
              
         cmd.extend(["-filter_complex", ";".join(filter_chain), "-map", "[v]", "-map", "[a]", "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", norm])
         try:
