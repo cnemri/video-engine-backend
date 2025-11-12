@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import logging
 from .config import OUTPUT_DIR, PROJECT_ID
 from .routers import projects, assets, timeline
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Google AI GenMedia Video Engine API")
 

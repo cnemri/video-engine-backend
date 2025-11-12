@@ -10,7 +10,7 @@ load_dotenv()
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(BASE_DIR, "output"))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(BASE_DIR, "tmp"))
 PROJECTS_DIR = os.path.join(OUTPUT_DIR, "projects")
 STAGING_DIR = os.path.join(OUTPUT_DIR, "assets")
 ANCHOR_DIR = os.path.join(OUTPUT_DIR, "anchors")
@@ -22,7 +22,9 @@ for d in [OUTPUT_DIR, PROJECTS_DIR, STAGING_DIR, ANCHOR_DIR, TEMP_DIR]:
 WORKER_THREADS_ASSETS = 8
 WORKER_THREADS_VEO = 4
 
-MODEL_THINKING = "gemini-2.5-flash-preview-09-2025"
+# MODEL_THINKING = "gemini-2.5-flash-preview-09-2025"
+MODEL_THINKING = "gemini-2.5-flash"
+# MODEL_THINKING = "gemini-2.5-pro"
 MODEL_IMAGEN = "gemini-2.5-flash-image"
 MODEL_VEO = "veo-3.1-generate-preview"
 MODEL_TTS = "gemini-2.5-pro-tts"

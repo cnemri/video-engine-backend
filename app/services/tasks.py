@@ -74,6 +74,59 @@ def ensure_local(path: str) -> str:
     local_path = os.path.join(TEMP_DIR, f"{name_hash}_{uuid.uuid4().hex[:6]}{ext}")
     return download_from_gcs(path, local_path)
 
+def generate_with_thinking(pid: str, model: str, contents: List[Any], config: types.GenerateContentConfig, response_model: Any = None) -> Any:
+    full_json_text = ""
+    current_thought_buffer = ""
+    last_update_time = 0 # Force immediate first update
+    
+    # Ensure we request JSON mime type if a schema is provided
+    if response_model:
+        config.response_mime_type = "application/json"
+        config.response_schema = response_model
+
+    try:
+        # Use streaming
+        for chunk in genai_client.models.generate_content_stream(model=model, contents=contents, config=config):
+            if not chunk.candidates: continue
+            
+            for part in chunk.candidates[0].content.parts:
+                # Check for thought
+                is_thought = getattr(part, 'thought', False)
+                
+                if is_thought:
+                    current_thought_buffer += part.text
+                    # Update Firestore every 0.5 seconds
+                    if pid and time.time() - last_update_time > 0.5:
+                        # Strategy: Always show from the LAST bold title onwards.
+                        # This ensures "Title + Details" are kept together.
+                        bold_matches = list(re.finditer(r'\*\*.*?\*\*', current_thought_buffer, re.DOTALL))
+                        if bold_matches:
+                            last_match = bold_matches[-1]
+                            display_thought = current_thought_buffer[last_match.start():]
+                        else:
+                            # Fallback: Last paragraph(s)
+                            blocks = current_thought_buffer.split('\n\n')
+                            display_thought = blocks[-1]
+                            if len(display_thought) < 50 and len(blocks) > 1:
+                                display_thought = blocks[-2] + "\n\n" + display_thought
+                        
+                        update_project(pid, current_thought=display_thought)
+                        last_update_time = time.time()
+                else:
+                    full_json_text += part.text
+        
+        # Final update to clear thought
+        if pid:
+            update_project(pid, current_thought=None)
+        
+        if response_model:
+             return json.loads(full_json_text)
+        return full_json_text
+        
+    except Exception as e:
+        logging.error(f"Generation failed: {e}")
+        raise
+
 # === CORE TASKS ===
 @retry_backoff()
 def task_analyze_image(pid: str, fpath: str, user_prompt: str, asset_description: str = None) -> List[Dict]:
@@ -85,17 +138,17 @@ def task_analyze_image(pid: str, fpath: str, user_prompt: str, asset_description
     if asset_description:
         final_prompt = f"{user_prompt}\n\nCONTEXT: The user has provided this image with the description: '{asset_description}'. Use this to correctly identify the subject."
 
-    res = genai_client.models.generate_content(
+    analysis = generate_with_thinking(
+        pid=pid,
         model=MODEL_THINKING,
         contents=[PROMPT_ANALYZER.format(user_prompt=final_prompt, source_file=os.path.basename(fpath)), types.Part.from_bytes(data=img_data, mime_type="image/png")],
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", 
-            response_schema=AssetAnalysis, 
             temperature=0.1,
-            thinking_config={"thinking_budget": -1}
-        )
+            thinking_config={"thinking_budget": -1, "include_thoughts": True} 
+        ),
+        response_model=AssetAnalysis
     )
-    analysis = parse_json_response(res, AssetAnalysis)
+    
     items = analysis.get("items", [])
     for item in items: item["source_file"] = fpath # Keep original (GCS) path in model
     if local_fpath != fpath and os.path.exists(local_fpath): os.remove(local_fpath) # Clean up temp
@@ -119,42 +172,67 @@ def task_detective(pid: str, prompt: str, potential_assets: List[Dict]) -> Dict:
                      if local_path != src and os.path.exists(local_path): os.remove(local_path)
                  except Exception as e:
                      log_project(pid, f"Warning: Failed to load potential asset {src}: {e}")
-    res = genai_client.models.generate_content(
-        model=MODEL_THINKING, contents=parts,
+    
+    report = generate_with_thinking(
+        pid=pid,
+        model=MODEL_THINKING, 
+        contents=parts,
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", 
-            response_schema=DetectiveReport, 
             temperature=0.2,
-            thinking_config={"thinking_budget": -1}
-        )
+            thinking_config={"thinking_budget": -1, "include_thoughts": True}
+        ),
+        response_model=DetectiveReport
     )
-    return parse_json_response(res, DetectiveReport)
+    
+    # Validate and fix assets
+    for asset in report.get("assets", []):
+        if not asset.get("name"):
+            asset["name"] = f"Asset {asset.get('id', 'Unknown')}"
+        if not asset.get("visual_prompt"):
+            # Fallback: Use description + visual style
+            asset["visual_prompt"] = f"{asset.get('description', '')}, {report.get('visual_style', '')}"
+        
+        # Enforce voice_style for characters
+        if asset.get("type") == "character" and not asset.get("voice_style"):
+            asset["voice_style"] = "Neutral, clear, standard voice"
+            
+    return report
 
 @retry_backoff()
 def task_architect(pid: str, report: Dict) -> Dict:
-    res = genai_client.models.generate_content(
-        model=MODEL_THINKING, contents=[PROMPT_ARCHITECT, json.dumps(report)],
+    manifest = generate_with_thinking(
+        pid=pid,
+        model=MODEL_THINKING, 
+        contents=[PROMPT_ARCHITECT, json.dumps(report)],
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", 
-            response_schema=ArchitectManifest, 
             temperature=0.7,
-            thinking_config={"thinking_budget": -1}
-        )
+            thinking_config={"thinking_budget": -1, "include_thoughts": True}
+        ),
+        response_model=ArchitectManifest
     )
-    return parse_json_response(res, ArchitectManifest)
+    
+    # Validate timeline prompts
+    for seg in manifest.get("timeline", []):
+        if not seg.get("anchor_prompt"):
+            seg["anchor_prompt"] = seg.get("scene_details", {}).get("main_action", "Cinematic shot")
+        if not seg.get("veo_prompt"):
+            seg["veo_prompt"] = seg.get("anchor_prompt")
+            
+    return manifest
 
 @retry_backoff()
 def task_critic(pid: str, report: Dict, manifest: Dict) -> Dict:
-    res = genai_client.models.generate_content(
-        model=MODEL_THINKING, contents=[PROMPT_CRITIC, f"DETECTIVE REPORT: {json.dumps(report)}\nDIRECTOR MANIFEST: {json.dumps(manifest)}"],
+    critique = generate_with_thinking(
+        pid=pid,
+        model=MODEL_THINKING, 
+        contents=[PROMPT_CRITIC, f"DETECTIVE REPORT: {json.dumps(report)}\nDIRECTOR MANIFEST: {json.dumps(manifest)}"],
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", 
-            response_schema=CritiqueResult, 
             temperature=0.1,
-            thinking_config={"thinking_budget": -1}
-        )
+            thinking_config={"thinking_budget": -1, "include_thoughts": True}
+        ),
+        response_model=CritiqueResult
     )
-    critique = parse_json_response(res, CritiqueResult)
+
     if not critique.get("approved") and critique.get("improved_manifest"):
         log_project(pid, f"CRITIQUE APPLIED: {critique.get('feedback')[:100]}...")
         improved = critique["improved_manifest"]
@@ -230,14 +308,22 @@ def task_finalize_assets(pid: str, manifest: Dict, report: Dict) -> Dict[str, Di
             else:
                 futs[pool.submit(task_gen_final, pid, asset, report.get("visual_style"), report.get("negative_prompt"))] = asset["id"]
         
+        total_tasks = len(futs)
+        completed_count = 0
+        update_project(pid, progress=0) # Reset progress for this step
+
         # INCREMENTAL UPDATE LOOP
         for f in as_completed(futs): 
+            completed_count += 1
+            prog = int((completed_count / total_tasks) * 100)
+            
             try: 
                 res = f.result()
                 final_map[res["id"]] = res
-                update_project(pid, asset_map=final_map)
+                update_project(pid, asset_map=final_map, progress=prog)
             except Exception as e: 
                 log_project(pid, f"Asset failed: {e}")
+                update_project(pid, progress=prog)
     return final_map
 
 def create_collage(images: List[str]) -> str:
@@ -269,20 +355,20 @@ def create_collage(images: List[str]) -> str:
     return out
 
 @retry_backoff()
-def task_critique_anchor(image_path: str, prompt: str, style: str) -> Dict:
+def task_critique_anchor(pid: str, image_path: str, prompt: str, style: str) -> Dict:
     # image_path here is likely local temp from task_gen_anchor loop
     with open(image_path, "rb") as f: img_data = f.read()
-    res = genai_client.models.generate_content(
+    
+    return generate_with_thinking(
+        pid=None, # Disable thought updates for this step (progress bar only)
         model=MODEL_THINKING,
         contents=[PROMPT_ANCHOR_CRITIC.format(visual_style=style, prompt=prompt), types.Part.from_bytes(data=img_data, mime_type="image/png")],
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", 
-            response_schema=AnchorCritiqueResult, 
             temperature=0.2,
-            thinking_config={"thinking_budget": -1}
-        )
+            thinking_config={"thinking_budget": -1, "include_thoughts": True}
+        ),
+        response_model=AnchorCritiqueResult
     )
-    return parse_json_response(res, AnchorCritiqueResult)
 
 @retry_backoff()
 def task_gen_anchor(pid: str, seg_id: str, seg: Dict, assets: Dict[str, Dict], style: str, neg_prompt: str, is_end=False, start_anchor_path=None):
@@ -325,7 +411,7 @@ def task_gen_anchor(pid: str, seg_id: str, seg: Dict, assets: Dict[str, Dict], s
                 # Use UUID to prevent collisions between parallel retries
                 temp_path = os.path.join(TEMP_DIR, f"{pid}_{seg_id}_{suffix}_try{attempt}_{uuid.uuid4().hex[:6]}.png")
                 with open(temp_path, "wb") as f: f.write(res.candidates[0].content.parts[0].inline_data.data)
-                critique = task_critique_anchor(temp_path, current_prompt, style)
+                critique = task_critique_anchor(pid, temp_path, current_prompt, style)
                 
                 # FORCE ACCEPT ON 3RD ATTEMPT (attempt index 2)
                 if critique.get("approved") or attempt == 2:
@@ -351,7 +437,7 @@ def task_gen_anchor(pid: str, seg_id: str, seg: Dict, assets: Dict[str, Dict], s
     raise RuntimeError(f"Failed to generate anchor {seg_id} {suffix}: {last_error}")
 
 @retry_backoff()
-def task_optimize_veo_prompt(seg: Dict, style: str) -> str:
+def task_optimize_veo_prompt(pid: str, seg: Dict, style: str) -> str:
     dialogue = seg.get("dialogue", [])
     audio_context = "DIALOGUE PRESENT" if dialogue else "SILENT"
     dialogue_lines = "\n".join([f"- {l['speaker_id']}: {l['text']}" for l in dialogue]) if dialogue else "None"
@@ -370,13 +456,22 @@ def task_optimize_veo_prompt(seg: Dict, style: str) -> str:
         audio_context=audio_context, 
         dialogue_lines=dialogue_lines
     )
-    res = genai_client.models.generate_content(model=MODEL_THINKING, contents=[prompt_data], config=types.GenerateContentConfig(temperature=0.3, thinking_config={"thinking_budget": -1}))
-    return res.text.strip()
+    
+    res = generate_with_thinking(
+        pid=None, # Disable thought updates for this step (progress bar only)
+        model=MODEL_THINKING, 
+        contents=[prompt_data], 
+        config=types.GenerateContentConfig(
+            temperature=0.3, 
+            thinking_config={"thinking_budget": -1, "include_thoughts": True}
+        )
+    )
+    return res.strip()
 
 @retry_backoff()
 def task_run_veo(pid: str, seg_id: str, seg: Dict, anchor_path: str, style: str, end_anchor_path: str = None):
     gcs_out_path = get_gcs_path(pid, "output", f"{seg_id}_raw_{uuid.uuid4().hex[:6]}.mp4")
-    optimized_prompt = task_optimize_veo_prompt(seg, style)
+    optimized_prompt = task_optimize_veo_prompt(pid, seg, style)
     mode = seg.get("mode", "i2v")
     duration = int(seg.get("duration", 4))
     
@@ -426,7 +521,13 @@ def task_assemble(pid: str, manifest: Dict, v_map: Dict[str, str], a_map: Dict[s
     log_project(pid, "[ASSEMBLY] Finalizing...")
     clips = []
     temp_files = []
-    for seg in manifest.get("timeline", []):
+    total_segments = len(manifest.get("timeline", []))
+    
+    for i, seg in enumerate(manifest.get("timeline", [])):
+        # Progress range: 0 -> 100 (Step-specific)
+        prog = int(((i + 1) / total_segments) * 100)
+        update_project(pid, progress=prog)
+        
         sid = seg.get("id")
         vid_gcs, aud_gcs = v_map.get(sid), a_map.get(sid)
         if not vid_gcs: continue
@@ -486,176 +587,229 @@ def task_assemble(pid: str, manifest: Dict, v_map: Dict[str, str], a_map: Dict[s
 
 # === STEP EXECUTORS ===
 def step_ingest(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="ingest")
-    log_project(pid, "Starting Ingestion...")
-    potential = []
-    file_paths = proj.get("file_paths", [])
-    if file_paths:
-        with ThreadPoolExecutor(WORKER_THREADS_ASSETS) as pool:
-            futs = []
-            for item in file_paths:
-                if isinstance(item, str):
-                    path = item
-                    desc = None
-                else:
-                    path = item.get("path")
-                    desc = item.get("description")
-                
-                if path:
-                    futs.append(pool.submit(task_analyze_image, pid, path, proj["prompt"], desc))
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="ingest")
+        log_project(pid, "Starting Ingestion...")
+        potential = []
+        file_paths = proj.get("file_paths", [])
+        if file_paths:
+            with ThreadPoolExecutor(WORKER_THREADS_ASSETS) as pool:
+                futs = []
+                for item in file_paths:
+                    if isinstance(item, str):
+                        path = item
+                        desc = None
+                    else:
+                        path = item.get("path")
+                        desc = item.get("description")
+                    
+                    if path:
+                        futs.append(pool.submit(task_analyze_image, pid, path, proj["prompt"], desc))
 
-            for f in as_completed(futs):
-                try: potential.extend(f.result())
-                except Exception as e: log_project(pid, f"Analysis warning: {e}")
-    update_project(pid, potential_assets=potential, status="waiting_detective", progress=15)
-    log_project(pid, "Ingestion complete.")
+                for f in as_completed(futs):
+                    try: potential.extend(f.result())
+                    except Exception as e: log_project(pid, f"Analysis warning: {e}")
+        update_project(pid, potential_assets=potential, status="waiting_detective", progress=15)
+        log_project(pid, "Ingestion complete.")
+    except Exception as e:
+        logging.error(f"Step ingest failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Ingest step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_detective(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="detective")
-    log_project(pid, "Starting Detective...")
-    potential = proj.get("potential_assets", [])
-    report = task_detective(pid, proj["prompt"], potential)
-    
-    # Ensure Asset IDs and Types exist
-    for asset in report.get("assets", []):
-        if "id" not in asset: asset["id"] = str(uuid.uuid4())[:8]
-        if "type" not in asset: asset["type"] = "object"
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="detective")
+        log_project(pid, "Starting Detective...")
+        potential = proj.get("potential_assets", [])
+        report = task_detective(pid, proj["prompt"], potential)
+        
+        # Ensure Asset IDs and Types exist
+        for asset in report.get("assets", []):
+            if "id" not in asset: asset["id"] = str(uuid.uuid4())[:8]
+            if "type" not in asset: asset["type"] = "object"
 
-    update_project(pid, report=report, status="waiting_planning", progress=25)
-    log_project(pid, "Detective complete.")
+        update_project(pid, report=report, status="waiting_planning", progress=25)
+        log_project(pid, "Detective complete.")
+    except Exception as e:
+        logging.error(f"Step detective failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Detective step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_planning(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="planning")
-    log_project(pid, "Starting Planning...")
-    report = proj["report"]
-    raw_manifest = task_architect(pid, report)
-    manifest = task_critic(pid, report, raw_manifest)
-    
-    # Ensure IDs exist
-    for seg in manifest.get("timeline", []):
-        if "id" not in seg: seg["id"] = str(uuid.uuid4())[:8]
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="planning")
+        log_project(pid, "Starting Planning...")
+        report = proj["report"]
+        raw_manifest = task_architect(pid, report)
+        manifest = task_critic(pid, report, raw_manifest)
         
-    update_project(pid, manifest=manifest, status="waiting_assets", progress=35)
-    log_project(pid, "Planning complete.")
+        # Ensure IDs exist
+        for seg in manifest.get("timeline", []):
+            if "id" not in seg: seg["id"] = str(uuid.uuid4())[:8]
+            
+        update_project(pid, manifest=manifest, status="waiting_assets", progress=35)
+        log_project(pid, "Planning complete.")
+    except Exception as e:
+        logging.error(f"Step planning failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Planning step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_assets(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="assets")
-    log_project(pid, "Starting Asset Finalization...")
-    manifest = proj["manifest"]
-    report = proj["report"]
-    # task_finalize_assets now handles incremental updates internally
-    task_finalize_assets(pid, manifest, report)
-    update_project(pid, status="waiting_anchors", progress=50)
-    log_project(pid, "Assets complete.")
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="assets")
+        log_project(pid, "Starting Asset Finalization...")
+        manifest = proj["manifest"]
+        report = proj["report"]
+        # task_finalize_assets now handles incremental updates internally
+        task_finalize_assets(pid, manifest, report)
+        update_project(pid, status="waiting_anchors", progress=0) # Reset for next step
+        log_project(pid, "Assets complete.")
+    except Exception as e:
+        logging.error(f"Step assets failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Assets step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_anchors(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="anchors")
-    log_project(pid, "Starting Anchor Generation...")
-    manifest = proj["manifest"]
-    
-    # Ensure IDs exist (migration from Pydantic to dicts lost default_factory)
-    timeline = manifest.get("timeline", [])
-    modified = False
-    for seg in timeline:
-        if "id" not in seg:
-            seg["id"] = str(uuid.uuid4())[:8]
-            modified = True
-    if modified:
-        update_project(pid, manifest=manifest)
-
-    report = proj["report"]
-    asset_map = proj.get("asset_map", {})
-    
-    anchor_map = proj.get("anchor_map", {})
-    
-    with ThreadPoolExecutor(WORKER_THREADS_ASSETS) as pool:
-        start_futs = {}
-        end_futs = {}
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="anchors")
+        log_project(pid, "Starting Anchor Generation...")
+        manifest = proj["manifest"]
         
-        # Submit all start anchors initially
-        for seg in manifest.get("timeline", []):
-            f = pool.submit(task_gen_anchor, pid, seg["id"], seg, asset_map, report.get("visual_style"), report.get("negative_prompt"), False)
-            start_futs[f] = seg["id"]
+        # Ensure IDs exist (migration from Pydantic to dicts lost default_factory)
+        timeline = manifest.get("timeline", [])
+        modified = False
+        for seg in timeline:
+            if "id" not in seg:
+                seg["id"] = str(uuid.uuid4())[:8]
+                modified = True
+        if modified:
+            update_project(pid, manifest=manifest)
 
-        # Wait for ANY future to complete (start or end)
-        while start_futs or end_futs:
-            current_futs = list(start_futs.keys()) + list(end_futs.keys())
-            if not current_futs: break
+        report = proj["report"]
+        asset_map = proj.get("asset_map", {})
+        
+        anchor_map = proj.get("anchor_map", {})
+        
+        with ThreadPoolExecutor(WORKER_THREADS_ASSETS) as pool:
+            start_futs = {}
+            end_futs = {}
             
-            from concurrent.futures import wait, FIRST_COMPLETED
-            done, not_done = wait(current_futs, return_when=FIRST_COMPLETED)
-            
-            for f in done:
-                try:
-                    res = f.result()
-                    if f in start_futs:
-                        seg_id = start_futs.pop(f)
-                        anchor_map[f"{seg_id}_start"] = res
-                        update_project(pid, anchor_map=anchor_map)
-                        seg = next(s for s in manifest["timeline"] if s["id"] == seg_id)
-                        if seg.get("mode") == VeoMode.FI:
-                            ef = pool.submit(task_gen_anchor, pid, seg["id"], seg, asset_map, report.get("visual_style"), report.get("negative_prompt"), True, res)
-                            end_futs[ef] = seg["id"]
-                    elif f in end_futs:
-                        seg_id = end_futs.pop(f)
-                        anchor_map[f"{seg_id}_end"] = res
-                        update_project(pid, anchor_map=anchor_map)
-                except Exception as e:
-                    if f in start_futs: log_project(pid, f"Start anchor failed for {start_futs.pop(f)}: {e}")
-                    elif f in end_futs: log_project(pid, f"End anchor failed for {end_futs.pop(f)}: {e}")
+            # Submit all start anchors initially
+            for seg in manifest.get("timeline", []):
+                f = pool.submit(task_gen_anchor, pid, seg["id"], seg, asset_map, report.get("visual_style"), report.get("negative_prompt"), False)
+                start_futs[f] = seg["id"]
 
-    update_project(pid, status="waiting_production", progress=75)
-    log_project(pid, "Anchors complete.")
+            # Wait for ANY future to complete (start or end)
+            completed_count = 0
+            # Estimate total tasks: start anchors + potential end anchors (assume 50% have end anchors for progress calc)
+            total_estimated = len(manifest.get("timeline", [])) * 1.5 
+            update_project(pid, progress=0) # Reset progress
+
+            while start_futs or end_futs:
+                current_futs = list(start_futs.keys()) + list(end_futs.keys())
+                if not current_futs: break
+                
+                from concurrent.futures import wait, FIRST_COMPLETED
+                done, not_done = wait(current_futs, return_when=FIRST_COMPLETED)
+                
+                for f in done:
+                    completed_count += 1
+                    # Progress range: 0 -> 100 (Step-specific)
+                    prog = int((completed_count / total_estimated) * 100)
+                    update_project(pid, progress=min(99, prog))
+                    
+                    try:
+                        res = f.result()
+                        if f in start_futs:
+                            seg_id = start_futs.pop(f)
+                            anchor_map[f"{seg_id}_start"] = res
+                            update_project(pid, anchor_map=anchor_map)
+                            seg = next(s for s in manifest["timeline"] if s["id"] == seg_id)
+                            if seg.get("mode") == VeoMode.FI:
+                                ef = pool.submit(task_gen_anchor, pid, seg["id"], seg, asset_map, report.get("visual_style"), report.get("negative_prompt"), True, res)
+                                end_futs[ef] = seg["id"]
+                        elif f in end_futs:
+                            seg_id = end_futs.pop(f)
+                            anchor_map[f"{seg_id}_end"] = res
+                            update_project(pid, anchor_map=anchor_map)
+                    except Exception as e:
+                        if f in start_futs: log_project(pid, f"Start anchor failed for {start_futs.pop(f)}: {e}")
+                        elif f in end_futs: log_project(pid, f"End anchor failed for {end_futs.pop(f)}: {e}")
+
+        update_project(pid, status="waiting_production", progress=0) # Reset for next step
+        log_project(pid, "Anchors complete.")
+    except Exception as e:
+        logging.error(f"Step anchors failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Anchors step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_production(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="production")
-    log_project(pid, "Starting Production...")
-    manifest = proj["manifest"]
-    report = proj["report"]
-    anchor_map = proj["anchor_map"]
-    
-    v_map, a_map = proj.get("video_map", {}), proj.get("audio_map", {})
-    
-    # Use separate pools for VEO (limited quota) and TTS (high quota)
-    with ThreadPoolExecutor(WORKER_THREADS_VEO) as veo_pool, \
-         ThreadPoolExecutor(max_workers=16) as tts_pool:
-         
-        veo_futs = {veo_pool.submit(task_run_veo, pid, seg["id"], seg, anchor_map[f"{seg['id']}_start"], report.get("visual_style"), anchor_map.get(f"{seg['id']}_end")): seg["id"] for seg in manifest.get("timeline", [])}
-        tts_futs = {tts_pool.submit(task_render_audio, pid, seg["id"], seg, manifest.get("narrator_voice_style"), manifest.get("language", "en-US")): seg["id"] for seg in manifest.get("timeline", [])}
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="production")
+        log_project(pid, "Starting Production...")
+        manifest = proj["manifest"]
+        report = proj["report"]
+        anchor_map = proj["anchor_map"]
         
-        futs_to_type = {}
-        for f, sid in veo_futs.items(): futs_to_type[f] = ('video', sid)
-        for f, sid in tts_futs.items(): futs_to_type[f] = ('audio', sid)
+        v_map, a_map = proj.get("video_map", {}), proj.get("audio_map", {})
         
-        for f in as_completed(futs_to_type):
-            type_, sid = futs_to_type[f]
-            try:
-                res = f.result()
-                if type_ == 'video': v_map[sid] = res
-                else: a_map[sid] = res
-                update_project(pid, video_map=v_map, audio_map=a_map)
-            except Exception as e:
-                log_project(pid, f"{type_} failed for {sid}: {e}")
-        
-    update_project(pid, status="waiting_assembly", progress=90)
-    log_project(pid, "Production complete.")
+        # Use separate pools for VEO (limited quota) and TTS (high quota)
+        with ThreadPoolExecutor(WORKER_THREADS_VEO) as veo_pool, \
+             ThreadPoolExecutor(max_workers=16) as tts_pool:
+             
+            veo_futs = {veo_pool.submit(task_run_veo, pid, seg["id"], seg, anchor_map[f"{seg['id']}_start"], report.get("visual_style"), anchor_map.get(f"{seg['id']}_end")): seg["id"] for seg in manifest.get("timeline", [])}
+            tts_futs = {tts_pool.submit(task_render_audio, pid, seg["id"], seg, manifest.get("narrator_voice_style"), manifest.get("language", "en-US")): seg["id"] for seg in manifest.get("timeline", [])}
+            
+            futs_to_type = {}
+            for f, sid in veo_futs.items(): futs_to_type[f] = ('video', sid)
+            for f, sid in tts_futs.items(): futs_to_type[f] = ('audio', sid)
+            
+            total_tasks = len(futs_to_type)
+            completed_count = 0
+            update_project(pid, progress=0) # Reset progress
+            
+            for f in as_completed(futs_to_type):
+                completed_count += 1
+                # Progress range: 0 -> 100 (Step-specific)
+                prog = int((completed_count / total_tasks) * 100)
+                
+                type_, sid = futs_to_type[f]
+                try:
+                    res = f.result()
+                    if type_ == 'video': v_map[sid] = res
+                    else: a_map[sid] = res
+                    update_project(pid, video_map=v_map, audio_map=a_map, progress=min(99, prog))
+                except Exception as e:
+                    log_project(pid, f"{type_} failed for {sid}: {e}")
+            
+        update_project(pid, status="waiting_assembly", progress=0) # Reset for next step
+        log_project(pid, "Production complete.")
+    except Exception as e:
+        logging.error(f"Step production failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Production step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))
 
 def step_assembly(pid: str):
-    proj = get_project(pid)
-    update_project(pid, status="running", current_step="assembly")
-    log_project(pid, "Starting Assembly...")
-    manifest = proj["manifest"]
-    final_path = task_assemble(pid, manifest, proj.get("video_map", {}), proj.get("audio_map", {}))
-    if final_path:
-        # Result URL is now a GCS path, frontend needs to handle it
-        update_project(pid, status="completed", progress=100, result={"url": final_path})
-        log_project(pid, "Assembly SUCCESS!")
-    else:
-        update_project(pid, status="failed", error="Assembly failed")
-        log_project(pid, "Assembly FAILED.")
+    try:
+        proj = get_project(pid)
+        update_project(pid, status="running", current_step="assembly")
+        log_project(pid, "Starting Assembly...")
+        manifest = proj["manifest"]
+        final_path = task_assemble(pid, manifest, proj.get("video_map", {}), proj.get("audio_map", {}))
+        if final_path:
+            # Result URL is now a GCS path, frontend needs to handle it
+            update_project(pid, status="completed", progress=100, result={"url": final_path})
+            log_project(pid, "Assembly SUCCESS!")
+        else:
+            update_project(pid, status="failed", error="Assembly failed")
+            log_project(pid, "Assembly FAILED.")
+    except Exception as e:
+        logging.error(f"Step assembly failed: {e}", exc_info=True)
+        log_project(pid, f"ERROR: Assembly step failed: {str(e)}")
+        update_project(pid, status="failed", error=str(e))

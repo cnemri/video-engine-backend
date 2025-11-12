@@ -13,4 +13,5 @@ dependencies = [
     "python-multipart>=0.0.20",
     "uvicorn>=0.38.0",
     "firebase-admin>=6.5.0",
+    "google-cloud-firestore>=2.21.0",
 ]

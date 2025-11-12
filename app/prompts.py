@@ -26,6 +26,7 @@ INSTRUCTIONS:
 1.  **Visual Style:** Define a cohesive, high-quality style for the WHOLE video based on the user request (e.g., "Cinematic photorealism, warm golden hour lighting, anamorphic lens").
 2.  **Negative Prompt:** Define what to AVOID to maintain that style.
 3.  **Assets:** Create `AssetDef` list. Use potential assets if available (copy details exactly). Generate new ones if needed to fulfill the user request.
+    *   **Characters:** `voice_style` is MANDATORY (e.g., "Male, deep, raspy, authoritative" or "Female, soft, whispery, youthful"). Include gender, tone, and pitch.
 4.  **Creative Brief:** Summarize the intended mood, pacing, and aesthetic.
 OUTPUT SCHEMA: DetectiveReport (JSON)
 """

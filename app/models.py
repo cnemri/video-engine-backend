@@ -37,14 +37,15 @@ class AssetAnalysis(BaseModel):
 
 class AssetDef(BaseModel):
     id: str
+    name: str
     type: AssetType
     is_supplied: bool = False
     description: str
+    visual_prompt: str
     voice_style: Optional[str] = None
     source_file: Optional[str] = None
     extraction_prompt: Optional[str] = None
     local_path: Optional[str] = None
-    visual_prompt: Optional[str] = None
 
 class VeoMode(str, Enum):
     I2V = "i2v"
